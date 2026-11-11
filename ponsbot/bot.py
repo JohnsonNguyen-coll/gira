@@ -10,12 +10,12 @@ from web3.exceptions import TransactionNotFound
 
 from .chain import Chain, ZERO
 from .config import Config
-from .rules import ticker_key, decimal_units, first_buy_matches
+from .rules import ticker_key, decimal_units, first_buy_matches, MIN_LAUNCH_AGE_SECONDS
 from .store import Store
 
 HELP = """👋 Chào bạn! Đây là bot canh token PONS v2 trên Robinhood Chain.
 
-Bot theo dõi token mới theo ticker, kiểm tra lệnh mua đầu tiên của creator hoặc bất kỳ ví nào, rồi tự mua khi đạt điều kiện bạn đặt. Ticker không phân biệt hoa thường. Bạn tự nhập tỷ lệ tổng cung và số ETH muốn mua cho từng lệnh.
+Bot theo dõi token mới theo ticker, kiểm tra lệnh mua đầu tiên của creator hoặc bất kỳ ví nào, rồi tự mua khi đạt điều kiện bạn đặt và đã qua ít nhất 5 giây từ lúc launch (theo timestamp block). Ticker không phân biệt hoa thường. Bạn tự nhập tỷ lệ tổng cung và số ETH muốn mua cho từng lệnh.
 
 🚀 BẮT ĐẦU
 1. Nạp ví: /key PRIVATE_KEY
@@ -42,6 +42,7 @@ Dấu * chấp nhận bất kỳ creator; có thể thay bằng địa chỉ cre
 /wallet — xem địa chỉ ví và số dư ETH
 /watch — tạo lệnh canh với điều kiện và số tiền bạn nhập
 /list — xem ID và trạng thái các lệnh
+/rpc — xem trạng thái RPC và số lần chuyển dự phòng
 /cancel ID — hủy lệnh còn đang canh, ví dụ /cancel 1
 /forget — bỏ ví khỏi RAM và hủy các lệnh đang canh
 
@@ -61,6 +62,7 @@ class Bot:
         self.worker = None
         self.app = None
         self.rpc_warning = False
+        self.last_rpc_switch = 0
 
     def authorized(self, update):
         return (update.effective_user is not None and update.effective_chat is not None
@@ -150,6 +152,7 @@ class Bot:
                                                 deployer, self.account.address, head['number'] + 1)
             await self.notify(f"Canh #{watch_id}: {symbol}\nLệnh mua đầu: {min_pct}–{maximum / 100:g}% tổng cung.\n"
                               f"Chi {amount_text} ETH + gas; thuế snipe ≤{tax_text}%.\n"
+                              f"Chờ ít nhất 5 giây từ lúc launch rồi mới mua.\n"
                               f"Chỉ launch mới từ block {head['number'] + 1}. DRY_RUN={self.config.dry_run}")
         except ValueError as exc:
             # Only input-validation errors here, never key/RPC exceptions.
@@ -175,6 +178,15 @@ class Bot:
             return
         cancelled = self.store.cancel(watch_id)
         await self.notify("Đã hủy." if cancelled else "Không có lệnh đang canh với ID này; lệnh đã gửi không thể hủy ở đây.")
+
+    async def rpc_status(self, update, context):
+        if not self.authorized(update):
+            return
+        provider = self.chain.web3.provider
+        await self.notify(f"RPC đang chọn: #{provider.active + 1}/{len(provider.urls)}\n"
+                          f"Số lần chuyển: {provider.switches}\n"
+                          f"RPC sai mạng đã loại: {len(provider.disabled)}\n"
+                          "Tự chuyển khi timeout, lỗi kết nối, rate limit hoặc lỗi RPC tạm thời.")
 
     async def scan(self, head):
         cursor = self.store.cursor()
@@ -214,6 +226,8 @@ class Bot:
     async def evaluate(self, watch_id, payload, head):
         watch = self.store.watch(watch_id)
         if not watch or watch['status'] != 'armed':
+            return
+        if head['timestamp'] - payload['timestamp'] < MIN_LAUNCH_AGE_SECONDS:
             return
         if head['timestamp'] - payload['timestamp'] > self.config.max_age:
             self.store.finish_candidate(watch_id, payload['token'])
@@ -303,6 +317,10 @@ class Bot:
                 if not self.rpc_warning:
                     await self.notify("Kết nối RPC tạm lỗi; chưa phát lệnh mới. Bot đang kết nối lại.")
                     self.rpc_warning = True
+            provider = self.chain.web3.provider
+            if provider.switches != self.last_rpc_switch:
+                self.last_rpc_switch = provider.switches
+                await self.notify(f"Đã chuyển RPC dự phòng: #{provider.active + 1}/{len(provider.urls)}.")
             await asyncio.sleep(self.config.poll)
 
     async def post_init(self, app):
@@ -332,7 +350,7 @@ class Bot:
                .post_init(self.post_init).post_shutdown(self.post_shutdown).build())
         for name, handler in [('start', self.start), ('help', self.start), ('key', self.key),
                               ('wallet', self.wallet), ('forget', self.forget), ('watch', self.watch),
-                              ('list', self.list_watches), ('cancel', self.cancel)]:
+                              ('list', self.list_watches), ('cancel', self.cancel), ('rpc', self.rpc_status)]:
             app.add_handler(CommandHandler(name, handler))
         app.add_error_handler(self.error)
         app.run_polling(drop_pending_updates=True, allowed_updates=['message'])

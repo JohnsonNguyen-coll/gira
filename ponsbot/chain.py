@@ -1,9 +1,10 @@
 import asyncio
 
-from web3 import AsyncWeb3, AsyncHTTPProvider, Web3
+from web3 import AsyncWeb3, Web3
 
 from .abi import FACTORY_ABI, TOKEN_ABI, CURVE_ABI
-from .rules import quote_buy
+from .rules import quote_buy, MIN_LAUNCH_AGE_SECONDS
+from .rpc import FailoverProvider, rpc_urls
 
 ZERO = "0x" + "00" * 20
 
@@ -11,7 +12,8 @@ ZERO = "0x" + "00" * 20
 class Chain:
     def __init__(self, config):
         self.config = config
-        self.web3 = AsyncWeb3(AsyncHTTPProvider(config.rpc, request_kwargs={"timeout": 10}))
+        self.web3 = AsyncWeb3(FailoverProvider(rpc_urls(config.rpc, config.rpc_list),
+                                              config.rpc_timeout, config.rpc_cooldown))
         self.factory = self.web3.eth.contract(address=Web3.to_checksum_address(config.factory),
                                                abi=FACTORY_ABI)
 
@@ -40,6 +42,10 @@ class Chain:
 
     async def plan_buy(self, payload, watch, account):
         head = await self.head()
+        # Use chain timestamps, not five seconds after RPC detection. Poll again
+        # without blocking other watches until the launch is old enough.
+        if head['timestamp'] - payload['timestamp'] < MIN_LAUNCH_AGE_SECONDS:
+            return None
         canonical = await self.web3.eth.get_block(payload['block'])
         if canonical['hash'].hex() != payload['block_hash']:
             raise ValueError("Launch removed by chain reorganisation")

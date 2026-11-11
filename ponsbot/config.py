@@ -19,6 +19,9 @@ class Config:
     max_gas_price: int
     max_gas: int
     data_dir: Path
+    rpc_list: tuple[str, ...] = ()
+    rpc_timeout: float = 3.0
+    rpc_cooldown: float = 15.0
 
     @classmethod
     def load(cls):
@@ -35,8 +38,12 @@ class Config:
                 int(os.environ.get("SLIPPAGE_BPS", "300")),
                 int(Decimal(os.environ.get("MAX_GAS_PRICE_GWEI", "20")) * 10**9),
                 int(os.environ.get("MAX_GAS_LIMIT", "1500000")),
-                Path(os.environ.get("DATA_DIR", "data")))
+                Path(os.environ.get("DATA_DIR", "data")),
+                tuple(u.strip() for u in os.environ.get("RPC_URLS", "").split(',') if u.strip()),
+                float(os.environ.get("RPC_TIMEOUT_SECONDS", "3")),
+                float(os.environ.get("RPC_COOLDOWN_SECONDS", "15")))
         if not (0 <= c.slippage < 10000 and c.poll >= 0.1 and c.max_age > 0
-                and c.max_gas >= 21000 and c.max_gas_price > 0):
+                and c.max_gas >= 21000 and c.max_gas_price > 0
+                and c.rpc_timeout > 0 and c.rpc_cooldown > 0):
             raise ValueError("Invalid execution limits in .env")
         return c

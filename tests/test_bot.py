@@ -9,6 +9,7 @@ from eth_account import Account
 from hexbytes import HexBytes
 
 from ponsbot.bot import Bot
+from ponsbot.chain import Chain
 from ponsbot.config import Config
 
 WALLET = '0x1111111111111111111111111111111111111111'
@@ -28,7 +29,7 @@ class BotTests(IsolatedAsyncioTestCase):
         self.wid = self.bot.store.add_watch('pons', 5000, 10000, 10**16, 300, None, WALLET, 10)
         self.payload = {'token': TOKEN, 'curve': CURVE, 'block': 10, 'timestamp': 100,
                         'block_hash': 'aa', 'symbol': 'PoNs'}
-        self.head = {'number': 11, 'timestamp': 102}
+        self.head = {'number': 11, 'timestamp': 105}
         first = {'blockNumber': 10, 'blockHash': HexBytes('0xaa'),
                  'args': {'tokensOut': 500}}
         supply_call = NS(call=AsyncMock(return_value=1000))
@@ -48,6 +49,25 @@ class BotTests(IsolatedAsyncioTestCase):
         await self.bot.evaluate(self.wid, self.payload, self.head)
         self.bot.chain.plan_buy.assert_awaited_once()
         self.bot.chain.web3.eth.send_raw_transaction.assert_not_awaited()
+
+    async def test_no_buy_before_five_seconds_even_when_condition_matches(self):
+        for timestamp in (100, 101, 104):
+            await self.bot.evaluate(self.wid, self.payload, {'number': 11, 'timestamp': timestamp})
+        self.assertEqual(self.bot.store.watch(self.wid)['status'], 'armed')
+        self.bot.chain.first_buy.assert_not_awaited()
+        self.bot.chain.plan_buy.assert_not_awaited()
+        self.bot.chain.web3.eth.send_raw_transaction.assert_not_awaited()
+        # Same candidate becomes eligible exactly at launch timestamp + 5.
+        await self.bot.evaluate(self.wid, self.payload, {'number': 12, 'timestamp': 105})
+        self.assertEqual(self.bot.store.watch(self.wid)['status'], 'simulated')
+
+    async def test_chain_plan_also_enforces_five_second_minimum(self):
+        chain = Chain.__new__(Chain)
+        chain.head = AsyncMock(return_value={'number': 11, 'timestamp': 104})
+        chain.web3 = NS(eth=NS(get_block=AsyncMock()))
+        result = await chain.plan_buy(self.payload, self.bot.store.watch(self.wid), self.bot.account)
+        self.assertIsNone(result)
+        chain.web3.eth.get_block.assert_not_awaited()
 
     async def test_first_buy_not_cumulative(self):
         self.bot.chain.first_buy.return_value['args']['tokensOut'] = 499

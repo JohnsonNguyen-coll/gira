@@ -1,6 +1,7 @@
 from decimal import Decimal, InvalidOperation
 
 BPS = 10_000
+MIN_LAUNCH_AGE_SECONDS = 5
 
 
 def decimal_units(text, decimals):
