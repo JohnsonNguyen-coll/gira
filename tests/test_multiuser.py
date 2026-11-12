@@ -79,6 +79,47 @@ class MultiUserTests(BotFixture, IsolatedAsyncioTestCase):
         self.assertEqual(row['wallet'], self.bot.accounts[999].address)
         self.assertEqual(int(row['amount']), 25 * 10**15)
 
+    async def test_exact_reported_command_accepts_50_point_963222_percent(self):
+        self.bot.chain.head = AsyncMock(return_value={'number': 50})
+        await self.bot.watch(update(123), NS(args=['DOG', '50', '0.025', '3']))
+        row = self.bot.store.watches(user_id=123)[-1]
+        self.assertEqual((row['min_bps'], row['max_bps']), (5000, 10000))
+        self.assertEqual(row['tax_limit'], 300)
+        first = self.bot.chain.first_buy.return_value
+        first['args']['tokensOut'] = 509_632_220
+        self.bot.chain.token.return_value.functions.totalSupply.return_value.call.return_value = 1_000_000_000
+        payload = {**self.payload, 'symbol': 'DOG'}
+        self.bot.notify.reset_mock()
+        await self.bot.evaluate(row['id'], payload, self.head)
+        self.assertEqual(self.bot.store.watch(row['id'])['status'], 'simulated')
+        self.bot.chain.plan_buy.assert_awaited_once()
+        self.assertNotIn('bỏ qua', self.bot.notify.call_args.args[0])
+
+    async def test_exact_reported_command_rejects_lower_percentages_with_saved_range(self):
+        self.bot.chain.head = AsyncMock(return_value={'number': 50})
+        for amount in (93_264_250, 46_256_560):
+            with self.subTest(tokens_out=amount):
+                await self.bot.watch(update(123), NS(args=['DOG', '50', '0.025', '3']))
+                row = self.bot.store.watches(user_id=123)[-1]
+                self.bot.chain.first_buy.return_value['args']['tokensOut'] = amount
+                self.bot.chain.token.return_value.functions.totalSupply.return_value.call.return_value = 1_000_000_000
+                await self.bot.evaluate(row['id'], {**self.payload, 'symbol': 'DOG'}, self.head)
+                self.assertEqual(self.bot.store.watch(row['id'])['status'], 'armed')
+                self.assertIn('Điều kiện đã lưu: 50–100%', self.bot.notify.call_args.args[0])
+                self.assertIn('thấp hơn mức tối thiểu 50%', self.bot.notify.call_args.args[0])
+                self.assertIn(self.bot.version, self.bot.notify.call_args.args[0])
+                self.assertEqual(self.bot.store.watch(row['id'])['detail'], self.bot.notify.call_args.args[0])
+        self.bot.chain.plan_buy.assert_not_awaited()
+
+    async def test_version_is_available_to_other_users(self):
+        await self.bot.version_info(update(999), NS())
+        self.bot.notify.assert_awaited_once_with(self.bot.version, user_id=999)
+
+    async def test_diagnostic_record_cannot_rearm_cancelled_watch(self):
+        self.bot.store.cancel(self.wid, user_id=123)
+        self.bot.store.record_check(self.wid, 'late diagnostic')
+        self.assertEqual(self.bot.store.watch(self.wid)['status'], 'cancelled')
+
     async def test_execution_selects_owner_key_and_routes_result_to_owner(self):
         wid = self.second_watch()
         await self.bot.evaluate(wid, self.payload, self.head)

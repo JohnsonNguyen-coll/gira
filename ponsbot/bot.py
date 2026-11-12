@@ -10,7 +10,8 @@ from web3.exceptions import TransactionNotFound
 
 from .chain import Chain, ZERO
 from .config import Config
-from .rules import ticker_key, decimal_units, first_buy_matches, MIN_LAUNCH_AGE_SECONDS
+from .rules import ticker_key, decimal_units, first_buy_rejection, MIN_LAUNCH_AGE_SECONDS
+from .diagnostics import build_version
 from .store import Store
 
 HELP = """👋 Chào bạn! Đây là bot canh token PONS v2 trên Robinhood Chain.
@@ -43,6 +44,7 @@ Dấu * chấp nhận bất kỳ creator; có thể thay bằng địa chỉ cre
 /watch — tạo lệnh canh với điều kiện và số tiền bạn nhập
 /list — xem ID và trạng thái các lệnh
 /rpc — xem trạng thái RPC và số lần chuyển dự phòng
+/version — xem phiên bản code thực sự đang chạy
 /cancel ID — hủy lệnh còn đang canh, ví dụ /cancel 1
 /forget — bỏ ví khỏi RAM và hủy các lệnh đang canh
 
@@ -64,6 +66,7 @@ class Bot:
         self.app = None
         self.rpc_warning = False
         self.last_rpc_switch = 0
+        self.version = build_version()
 
     def authorized(self, update):
         return (update.effective_user is not None and update.effective_chat is not None
@@ -78,7 +81,9 @@ class Bot:
         if recipient <= 0:
             return
         try:
-            await self.app.bot.send_message(recipient, text)
+            # Saved diagnostics can make /list longer than Telegram's limit.
+            for offset in range(0, len(text), 3500):
+                await self.app.bot.send_message(recipient, text[offset:offset + 3500])
         except Exception:
             print("Telegram delivery failed; inspect /list when connected.")
 
@@ -88,7 +93,11 @@ class Bot:
             mode = ("🧪 Chế độ hiện tại: MÔ PHỎNG — không gửi giao dịch mua thật."
                     if self.config.dry_run else
                     "🟢 Chế độ hiện tại: MUA THẬT — lệnh đủ điều kiện sẽ tự gửi giao dịch.")
-            await update.message.reply_text(HELP + "\n" + mode)
+            await update.message.reply_text(HELP + "\n" + mode + "\n" + self.version)
+
+    async def version_info(self, update, context):
+        if self.authorized(update):
+            await self.notify(self.version, user_id=update.effective_user.id)
 
     async def key(self, update, context):
         if not self.authorized(update):
@@ -255,10 +264,30 @@ class Bot:
             return
         supply = await self.chain.token(payload['token']).functions.totalSupply().call(
             block_identifier=first['blockNumber'])
-        if not first_buy_matches(first['args']['tokensOut'], supply, watch['min_bps'], watch['max_bps']):
+        tokens_out = first['args']['tokensOut']
+        rejection = first_buy_rejection(tokens_out, supply, watch['min_bps'], watch['max_bps'])
+        if rejection:
             self.store.finish_candidate(watch_id, payload['token'])
-            pct = Decimal(first['args']['tokensOut']) * 100 / supply
-            await self.notify(f"#{watch_id}: bỏ qua {payload['token']}; lệnh đầu mua {pct:.6f}% tổng cung.", user_id=user_id)
+            pct = f"{Decimal(tokens_out) * 100 / supply:.6f}%" if supply > 0 else 'không xác định'
+            reason = {
+                'below_minimum': f"thấp hơn mức tối thiểu {watch['min_bps']/100:g}%",
+                'above_maximum': f"vượt mức tối đa {watch['max_bps']/100:g}%",
+                'invalid_supply': 'tổng cung không hợp lệ',
+                'invalid_range': 'khoảng % đã lưu không hợp lệ',
+            }[rejection]
+            detail = (
+                f"#{watch_id} ({watch['ticker']}): bỏ qua {payload['token']}; "
+                f"lệnh đầu mua {pct} tổng cung.\n"
+                f"Điều kiện đã lưu: {watch['min_bps']/100:g}–{watch['max_bps']/100:g}%.\n"
+                f"Lý do: {reason} (so sánh chính xác, không làm tròn).\n"
+                f"{self.version}")
+            self.store.record_check(watch_id, detail)
+            # No key, wallet balance or Telegram ID is logged.
+            print(f"First-buy filter | watch={watch_id} | token={payload['token']} | "
+                  f"tokens_out={tokens_out} | supply={supply} | "
+                  f"min_bps={watch['min_bps']} | max_bps={watch['max_bps']} | "
+                  f"reason={rejection} | {self.version}", flush=True)
+            await self.notify(detail, user_id=user_id)
             return
         async with self.lock:
             watch = self.store.watch(watch_id)
@@ -346,10 +375,10 @@ class Bot:
         if self.store.cursor() is None:
             self.store.set_cursor((await self.chain.head())['number'])
         self.worker = asyncio.create_task(self.run_watcher())
-        print(f"PONS bot started | chain=4663 | dry_run={self.config.dry_run}", flush=True)
+        print(f"PONS bot started | chain=4663 | dry_run={self.config.dry_run} | {self.version}", flush=True)
         for user_id in set(self.store.users()) | ({self.config.owner} if self.config.owner > 0 else set()):
             await self.notify(f"Bot đã chạy · PONS v2 · Robinhood 4663 · DRY_RUN={self.config.dry_run}\n"
-                              "Dùng /start. Sau restart cần nạp lại ví của bạn; các lệnh canh vẫn được lưu.",
+                              f"Dùng /start. Sau restart cần nạp lại ví của bạn; các lệnh canh vẫn được lưu.\n{self.version}",
                               user_id=user_id)
 
     async def post_shutdown(self, app):
@@ -371,7 +400,8 @@ class Bot:
                .post_init(self.post_init).post_shutdown(self.post_shutdown).build())
         for name, handler in [('start', self.start), ('help', self.start), ('key', self.key),
                               ('wallet', self.wallet), ('forget', self.forget), ('watch', self.watch),
-                              ('list', self.list_watches), ('cancel', self.cancel), ('rpc', self.rpc_status)]:
+                              ('list', self.list_watches), ('cancel', self.cancel), ('rpc', self.rpc_status),
+                              ('version', self.version_info)]:
             app.add_handler(CommandHandler(name, handler))
         app.add_error_handler(self.error)
         app.run_polling(drop_pending_updates=True, allowed_updates=['message'])

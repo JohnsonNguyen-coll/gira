@@ -23,11 +23,22 @@ def ticker_key(ticker):
     return ticker.casefold()
 
 
-def first_buy_matches(tokens_out, supply, minimum_bps, maximum_bps):
+def first_buy_rejection(tokens_out, supply, minimum_bps, maximum_bps):
     if supply <= 0:
-        return False
-    # Integer comparisons preserve exact supply fractions without float rounding.
-    return minimum_bps * supply <= tokens_out * BPS <= maximum_bps * supply
+        return 'invalid_supply'
+    if not 0 < minimum_bps <= maximum_bps <= BPS:
+        return 'invalid_range'
+    # Keep the exact integer comparison and the explanation in one decision.
+    scaled_output = tokens_out * BPS
+    if scaled_output < minimum_bps * supply:
+        return 'below_minimum'
+    if scaled_output > maximum_bps * supply:
+        return 'above_maximum'
+    return None
+
+
+def first_buy_matches(tokens_out, supply, minimum_bps, maximum_bps):
+    return first_buy_rejection(tokens_out, supply, minimum_bps, maximum_bps) is None
 
 
 def quote_buy(quote_in, quote_reserve, token_reserve, sellable, fee_bps,

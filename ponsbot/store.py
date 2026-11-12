@@ -103,6 +103,11 @@ class Store:
                                   (watch_id,))
         return cur.rowcount == 1
 
+    def record_check(self, watch_id, detail):
+        # Never re-arm a watch cancelled while RPC calls were in flight.
+        with self.db:
+            self.db.execute("UPDATE watches SET detail=? WHERE id=? AND status='armed'", (detail, watch_id))
+
     def status(self, watch_id, status, detail="", tx_hash=None):
         with self.db:
             self.db.execute("UPDATE watches SET status=?,detail=?,tx_hash=COALESCE(?,tx_hash) WHERE id=?",

@@ -1,6 +1,6 @@
 import unittest
 
-from ponsbot.rules import decimal_units, ticker_key, first_buy_matches, quote_buy
+from ponsbot.rules import decimal_units, ticker_key, first_buy_matches, first_buy_rejection, quote_buy
 
 
 class RulesTests(unittest.TestCase):
@@ -14,6 +14,13 @@ class RulesTests(unittest.TestCase):
         self.assertFalse(first_buy_matches(supply // 2 - 1, supply, 5000, 10000))
         self.assertTrue(first_buy_matches(supply // 2, supply, 5000, 5000))
         self.assertFalse(first_buy_matches(supply // 2 + 1, supply, 5000, 5000))
+
+    def test_rejection_distinguishes_lower_and_upper_bounds(self):
+        self.assertIsNone(first_buy_rejection(50963222, 100000000, 5000, 10000))
+        self.assertEqual(first_buy_rejection(49999999, 100000000, 5000, 10000), 'below_minimum')
+        self.assertEqual(first_buy_rejection(50963222, 100000000, 5000, 5000), 'above_maximum')
+        self.assertEqual(first_buy_rejection(10, 0, 5000, 10000), 'invalid_supply')
+        self.assertEqual(first_buy_rejection(50, 100, 5000, 100), 'invalid_range')
 
     def test_decimal_amount_without_float(self):
         self.assertEqual(decimal_units('0.000000000000000001', 18), 1)
