@@ -329,6 +329,7 @@ class Bot:
         if self.store.cursor() is None:
             self.store.set_cursor((await self.chain.head())['number'])
         self.worker = asyncio.create_task(self.run_watcher())
+        print(f"PONS bot started | chain=4663 | dry_run={self.config.dry_run}", flush=True)
         await self.notify(f"Bot đã chạy · PONS v2 · Robinhood 4663 · DRY_RUN={self.config.dry_run}\n"
                           "Dùng /start. Sau restart cần nạp lại ví; các lệnh canh vẫn được lưu.")
 
