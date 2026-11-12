@@ -47,6 +47,7 @@ Dấu * chấp nhận bất kỳ creator; có thể thay bằng địa chỉ cre
 /forget — bỏ ví khỏi RAM và hủy các lệnh đang canh
 
 Mỗi lệnh chỉ mua một lần và chỉ xét launch mới sau khi đặt lệnh. Bot không bảo đảm mua kế tiếp ngay sau lệnh đầu. Hiện hỗ trợ PONS v2 ghép ETH.
+Mỗi người có ví và lệnh riêng: /wallet, /list, /cancel và /forget chỉ áp dụng cho tài khoản Telegram của bạn.
 
 🔐 Chỉ nạp key của ví riêng cho bot trong chat riêng này. Telegram không mã hóa đầu cuối. Sau khi khởi động lại bot, bạn cần nạp lại ví.
 """
@@ -56,8 +57,8 @@ class Bot:
     def __init__(self, config):
         self.config = config
         self.chain = Chain(config)
-        self.store = Store(config.data_dir / "bot.sqlite3")
-        self.account = None
+        self.store = Store(config.data_dir / "bot.sqlite3", legacy_owner=config.owner)
+        self.accounts = {}
         self.lock = asyncio.Lock()
         self.worker = None
         self.app = None
@@ -66,19 +67,24 @@ class Bot:
 
     def authorized(self, update):
         return (update.effective_user is not None and update.effective_chat is not None
-                and update.effective_user.id == self.config.owner
                 and update.effective_chat.type == "private"
-                and update.effective_chat.id == self.config.owner)
+                and update.effective_user.id > 0
+                and update.effective_chat.id == update.effective_user.id)
 
-    async def notify(self, text):
+    async def notify(self, text, *, user_id=None):
         # A Telegram outage must never unwind a transaction state change.
+        # Omitting user_id is reserved for infrastructure alerts to the admin.
+        recipient = self.config.owner if user_id is None else user_id
+        if recipient <= 0:
+            return
         try:
-            await self.app.bot.send_message(self.config.owner, text)
+            await self.app.bot.send_message(recipient, text)
         except Exception:
             print("Telegram delivery failed; inspect /list when connected.")
 
     async def start(self, update, context):
         if self.authorized(update):
+            self.store.register_user(update.effective_user.id)
             mode = ("🧪 Chế độ hiện tại: MÔ PHỎNG — không gửi giao dịch mua thật."
                     if self.config.dry_run else
                     "🟢 Chế độ hiện tại: MUA THẬT — lệnh đủ điều kiện sẽ tự gửi giao dịch.")
@@ -87,48 +93,54 @@ class Bot:
     async def key(self, update, context):
         if not self.authorized(update):
             return
+        user_id = update.effective_user.id
         # Delete even malformed key messages. Never repeat the message or exceptions.
         try:
             await update.message.delete()
         except Exception:
-            await self.notify("Không xóa được tin nhắn key; không nạp ví. Xóa tin nhắn thủ công.")
+            await self.notify("Không xóa được tin nhắn key; không nạp ví. Xóa tin nhắn thủ công.", user_id=user_id)
             return
         try:
             if len(context.args) != 1:
                 raise ValueError()
             account = Account.from_key(context.args[0])
         except Exception:
-            await self.notify("Private key không hợp lệ. Không lưu key.")
+            await self.notify("Private key không hợp lệ. Không lưu key.", user_id=user_id)
             return
         async with self.lock:
-            if any(w['wallet'].lower() != account.address.lower() for w in self.store.watches(armed=True)):
-                await self.notify("Hủy các lệnh đang canh trước khi đổi ví.")
+            if any(w['wallet'].lower() != account.address.lower()
+                   for w in self.store.watches(armed=True, user_id=user_id)):
+                await self.notify("Hủy các lệnh đang canh trước khi đổi ví.", user_id=user_id)
                 return
-            self.account = account
-        await self.notify(f"Đã nạp ví {account.address}. Key chỉ nằm trong RAM đến khi tắt bot hoặc /forget.")
+            self.accounts[user_id] = account
+            self.store.register_user(user_id)
+        await self.notify(f"Đã nạp ví {account.address}. Key chỉ nằm trong RAM đến khi tắt bot hoặc /forget.", user_id=user_id)
 
     async def forget(self, update, context):
         if not self.authorized(update):
             return
+        user_id = update.effective_user.id
         # These synchronous updates can cancel an in-flight quote before claim().
-        self.account = None
-        for watch in self.store.watches(armed=True):
-            self.store.cancel(watch['id'])
-        await self.notify("Đã bỏ ví khỏi RAM và hủy các lệnh đang canh. Giao dịch đã gửi vẫn tiếp tục.")
+        self.accounts.pop(user_id, None)
+        for watch in self.store.watches(armed=True, user_id=user_id):
+            self.store.cancel(watch['id'], user_id=user_id)
+        await self.notify("Đã bỏ ví của bạn khỏi RAM và hủy các lệnh của bạn đang canh. Giao dịch đã gửi vẫn tiếp tục.", user_id=user_id)
 
     async def wallet(self, update, context):
         if not self.authorized(update):
             return
-        account = self.account
+        user_id = update.effective_user.id
+        account = self.accounts.get(user_id)
         if not account:
-            await self.notify("Chưa nạp ví. Dùng /key trong chat riêng.")
+            await self.notify("Chưa nạp ví. Dùng /key trong chat riêng.", user_id=user_id)
             return
         balance = await self.chain.web3.eth.get_balance(account.address)
-        await self.notify(f"{account.address}\n{Web3.from_wei(balance, 'ether')} ETH\nDRY_RUN={self.config.dry_run}")
+        await self.notify(f"{account.address}\n{Web3.from_wei(balance, 'ether')} ETH\nDRY_RUN={self.config.dry_run}", user_id=user_id)
 
     async def watch(self, update, context):
         if not self.authorized(update):
             return
+        user_id = update.effective_user.id
         try:
             if not 4 <= len(context.args) <= 6:
                 raise ValueError("/watch TICKER MIN_PERCENT ETH MAX_SNIPE_PERCENT [DEPLOYER] [MAX_PERCENT]")
@@ -144,40 +156,43 @@ class Bot:
                 raise ValueError("Kiểm tra % tổng cung (0–100), ETH >0, thuế snipe 0–99%.")
             head = await self.chain.head()
             async with self.lock:
-                if not self.account:
+                account = self.accounts.get(user_id)
+                if not account:
                     raise ValueError("Nạp ví bằng /key trước khi canh.")
-                if len(self.store.watches(armed=True)) >= 20:
+                if len(self.store.watches(armed=True, user_id=user_id)) >= 20:
                     raise ValueError("Tối đa 20 lệnh đang canh.")
                 watch_id = self.store.add_watch(ticker, minimum, maximum, amount, tax,
-                                                deployer, self.account.address, head['number'] + 1)
+                                                deployer, account.address, head['number'] + 1, user_id=user_id)
             await self.notify(f"Canh #{watch_id}: {symbol}\nLệnh mua đầu: {min_pct}–{maximum / 100:g}% tổng cung.\n"
                               f"Chi {amount_text} ETH + gas; thuế snipe ≤{tax_text}%.\n"
                               f"Chờ ít nhất 5 giây từ lúc launch rồi mới mua.\n"
-                              f"Chỉ launch mới từ block {head['number'] + 1}. DRY_RUN={self.config.dry_run}")
+                              f"Chỉ launch mới từ block {head['number'] + 1}. DRY_RUN={self.config.dry_run}", user_id=user_id)
         except ValueError as exc:
             # Only input-validation errors here, never key/RPC exceptions.
-            await self.notify(str(exc))
+            await self.notify(str(exc), user_id=user_id)
 
     async def list_watches(self, update, context):
         if not self.authorized(update):
             return
-        rows = self.store.watches()[-20:]
+        user_id = update.effective_user.id
+        rows = self.store.watches(user_id=user_id)[-20:]
         text = "\n\n".join(f"#{r['id']} {r['ticker']} · {r['status']}\n"
                             f"{r['min_bps']/100:g}–{r['max_bps']/100:g}% · "
                             f"{Decimal(r['amount'])/10**18} ETH\n"
                             f"{r['tx_hash'] or r['detail'] or ''}" for r in rows)
-        await self.notify(text or "Chưa có lệnh.")
+        await self.notify(text or "Chưa có lệnh.", user_id=user_id)
 
     async def cancel(self, update, context):
         if not self.authorized(update):
             return
+        user_id = update.effective_user.id
         try:
             watch_id = int(context.args[0])
         except (ValueError, IndexError):
-            await self.notify("/cancel ID")
+            await self.notify("/cancel ID", user_id=user_id)
             return
-        cancelled = self.store.cancel(watch_id)
-        await self.notify("Đã hủy." if cancelled else "Không có lệnh đang canh với ID này; lệnh đã gửi không thể hủy ở đây.")
+        cancelled = self.store.cancel(watch_id, user_id=user_id)
+        await self.notify("Đã hủy." if cancelled else "Không có lệnh đang canh của bạn với ID này; lệnh đã gửi không thể hủy ở đây.", user_id=user_id)
 
     async def rpc_status(self, update, context):
         if not self.authorized(update):
@@ -186,7 +201,8 @@ class Bot:
         await self.notify(f"RPC đang chọn: #{provider.active + 1}/{len(provider.urls)}\n"
                           f"Số lần chuyển: {provider.switches}\n"
                           f"RPC sai mạng đã loại: {len(provider.disabled)}\n"
-                          "Tự chuyển khi timeout, lỗi kết nối, rate limit hoặc lỗi RPC tạm thời.")
+                          "Tự chuyển khi timeout, lỗi kết nối, rate limit hoặc lỗi RPC tạm thời.",
+                          user_id=update.effective_user.id)
 
     async def scan(self, head):
         cursor = self.store.cursor()
@@ -225,13 +241,14 @@ class Bot:
 
     async def evaluate(self, watch_id, payload, head):
         watch = self.store.watch(watch_id)
-        if not watch or watch['status'] != 'armed':
+        if not watch or watch['status'] != 'armed' or watch['user_id'] <= 0:
             return
+        user_id = watch['user_id']
         if head['timestamp'] - payload['timestamp'] < MIN_LAUNCH_AGE_SECONDS:
             return
         if head['timestamp'] - payload['timestamp'] > self.config.max_age:
             self.store.finish_candidate(watch_id, payload['token'])
-            await self.notify(f"#{watch_id}: bỏ qua {payload['token']}: hết thời hạn launch.")
+            await self.notify(f"#{watch_id}: bỏ qua {payload['token']}: hết thời hạn launch.", user_id=user_id)
             return
         first = await self.chain.first_buy(payload['curve'], payload['block'], head['number'])
         if first is None:
@@ -241,11 +258,11 @@ class Bot:
         if not first_buy_matches(first['args']['tokensOut'], supply, watch['min_bps'], watch['max_bps']):
             self.store.finish_candidate(watch_id, payload['token'])
             pct = Decimal(first['args']['tokensOut']) * 100 / supply
-            await self.notify(f"#{watch_id}: bỏ qua {payload['token']}; lệnh đầu mua {pct:.6f}% tổng cung.")
+            await self.notify(f"#{watch_id}: bỏ qua {payload['token']}; lệnh đầu mua {pct:.6f}% tổng cung.", user_id=user_id)
             return
         async with self.lock:
             watch = self.store.watch(watch_id)
-            account = self.account
+            account = self.accounts.get(user_id)
             if (watch['status'] != 'armed' or not account
                     or watch['wallet'].lower() != account.address.lower()):
                 return
@@ -257,7 +274,7 @@ class Bot:
             except ValueError as exc:
                 # plan_buy's own messages contain no user secrets.
                 self.store.finish_candidate(watch_id, payload['token'])
-                await self.notify(f"#{watch_id}: bỏ qua {payload['token']}: {exc}")
+                await self.notify(f"#{watch_id}: bỏ qua {payload['token']}: {exc}", user_id=user_id)
                 return
             if plan is None:
                 return
@@ -267,7 +284,7 @@ class Bot:
             if self.config.dry_run:
                 self.store.status(watch_id, 'simulated', f"token={payload['token']} output={expected}")
                 await self.notify(f"DRY_RUN #{watch_id}: khớp {payload['symbol']} {payload['token']}.\n"
-                                  f"Mô phỏng thành công; thuế snipe {snipe/100:g}%. Không gửi giao dịch.")
+                                  f"Mô phỏng thành công; thuế snipe {snipe/100:g}%. Không gửi giao dịch.", user_id=user_id)
                 return
             # Store the deterministic hash BEFORE broadcasting. On timeout, never
             # submit a fresh transaction or choose another token for this watch.
@@ -277,9 +294,9 @@ class Bot:
                 self.store.status(watch_id, 'submitted', payload['token'], tx_hash)
                 await self.chain.web3.eth.send_raw_transaction(signed.raw_transaction)
             except Exception:
-                await self.notify(f"#{watch_id}: kết quả gửi chưa rõ. Đã khóa lệnh để tránh mua lặp. Xem /list.")
+                await self.notify(f"#{watch_id}: kết quả gửi chưa rõ. Đã khóa lệnh để tránh mua lặp. Xem /list.", user_id=user_id)
                 return
-            await self.notify(f"Đã gửi lệnh #{watch_id}: {payload['token']}\nTx: {tx_hash}")
+            await self.notify(f"Đã gửi lệnh #{watch_id}: {payload['token']}\nTx: {tx_hash}", user_id=user_id)
 
     async def reconcile(self):
         for watch in self.store.watches():
@@ -291,7 +308,7 @@ class Bot:
                 continue
             status = 'confirmed' if receipt['status'] == 1 else 'reverted'
             self.store.status(watch['id'], status, watch['detail'])
-            await self.notify(f"Lệnh #{watch['id']}: {status}\nTx: {watch['tx_hash']}")
+            await self.notify(f"Lệnh #{watch['id']}: {status}\nTx: {watch['tx_hash']}", user_id=watch['user_id'])
 
     async def run_watcher(self):
         while True:
@@ -330,21 +347,24 @@ class Bot:
             self.store.set_cursor((await self.chain.head())['number'])
         self.worker = asyncio.create_task(self.run_watcher())
         print(f"PONS bot started | chain=4663 | dry_run={self.config.dry_run}", flush=True)
-        await self.notify(f"Bot đã chạy · PONS v2 · Robinhood 4663 · DRY_RUN={self.config.dry_run}\n"
-                          "Dùng /start. Sau restart cần nạp lại ví; các lệnh canh vẫn được lưu.")
+        for user_id in set(self.store.users()) | ({self.config.owner} if self.config.owner > 0 else set()):
+            await self.notify(f"Bot đã chạy · PONS v2 · Robinhood 4663 · DRY_RUN={self.config.dry_run}\n"
+                              "Dùng /start. Sau restart cần nạp lại ví của bạn; các lệnh canh vẫn được lưu.",
+                              user_id=user_id)
 
     async def post_shutdown(self, app):
         if self.worker:
             self.worker.cancel()
             await asyncio.gather(self.worker, return_exceptions=True)
-        self.account = None
+        self.accounts.clear()
         await self.chain.close()
         self.store.db.close()
 
     async def error(self, update, context):
         # Telegram's default exception logging can include the Update containing a key.
         if isinstance(update, Update) and self.authorized(update):
-            await self.notify("Không hoàn tất được lệnh; kiểm tra /list. Chi tiết nhạy cảm không được ghi log.")
+            await self.notify("Không hoàn tất được lệnh; kiểm tra /list. Chi tiết nhạy cảm không được ghi log.",
+                              user_id=update.effective_user.id)
 
     def run(self):
         app = (Application.builder().token(self.config.token)

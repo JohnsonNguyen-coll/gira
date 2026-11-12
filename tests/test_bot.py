@@ -18,15 +18,15 @@ CURVE = '0x3333333333333333333333333333333333333333'
 FACTORY = '0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e'
 
 
-class BotTests(IsolatedAsyncioTestCase):
+class BotFixture:
     def setUp(self):
         self.tmp = TemporaryDirectory()
         config = Config('dummy', 123, 'http://localhost:8545', FACTORY, True,
                         .5, 60, 300, 20*10**9, 1_500_000, Path(self.tmp.name))
         self.bot = Bot(config)
         self.bot.notify = AsyncMock()
-        self.bot.account = NS(address=WALLET)
-        self.wid = self.bot.store.add_watch('pons', 5000, 10000, 10**16, 300, None, WALLET, 10)
+        self.bot.accounts[123] = NS(address=WALLET)
+        self.wid = self.bot.store.add_watch('pons', 5000, 10000, 10**16, 300, None, WALLET, 10, user_id=123)
         self.payload = {'token': TOKEN, 'curve': CURVE, 'block': 10, 'timestamp': 100,
                         'block_hash': 'aa', 'symbol': 'PoNs'}
         self.head = {'number': 11, 'timestamp': 105}
@@ -43,6 +43,8 @@ class BotTests(IsolatedAsyncioTestCase):
         self.bot.store.db.close()
         self.tmp.cleanup()
 
+
+class BotTests(BotFixture, IsolatedAsyncioTestCase):
     async def test_dry_run_does_not_send_and_is_one_shot(self):
         await self.bot.evaluate(self.wid, self.payload, self.head)
         self.assertEqual(self.bot.store.watch(self.wid)['status'], 'simulated')
@@ -65,7 +67,7 @@ class BotTests(IsolatedAsyncioTestCase):
         chain = Chain.__new__(Chain)
         chain.head = AsyncMock(return_value={'number': 11, 'timestamp': 104})
         chain.web3 = NS(eth=NS(get_block=AsyncMock()))
-        result = await chain.plan_buy(self.payload, self.bot.store.watch(self.wid), self.bot.account)
+        result = await chain.plan_buy(self.payload, self.bot.store.watch(self.wid), self.bot.accounts[123])
         self.assertIsNone(result)
         chain.web3.eth.get_block.assert_not_awaited()
 
@@ -85,7 +87,7 @@ class BotTests(IsolatedAsyncioTestCase):
         self.bot.chain.first_buy.assert_not_awaited()
 
     async def test_cancel_and_claim_cannot_both_win(self):
-        self.assertTrue(self.bot.store.cancel(self.wid))
+        self.assertTrue(self.bot.store.cancel(self.wid, user_id=123))
         self.assertFalse(self.bot.store.claim(self.wid))
         await self.bot.evaluate(self.wid, self.payload, self.head)
         self.bot.chain.plan_buy.assert_not_awaited()
@@ -100,22 +102,22 @@ class BotTests(IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.store.watch(self.wid)['status'], 'cancelled')
         self.bot.chain.web3.eth.send_raw_transaction.assert_not_awaited()
 
-    async def test_key_command_only_owner_private_chat(self):
-        update = NS(effective_user=NS(id=999), effective_chat=NS(id=999, type='private'),
+    async def test_key_command_rejects_group_chat(self):
+        update = NS(effective_user=NS(id=999), effective_chat=NS(id=-999, type='group'),
                     message=NS(delete=AsyncMock()))
         await self.bot.key(update, NS(args=['invalid']))
         update.message.delete.assert_not_awaited()
         self.bot.notify.assert_not_awaited()
 
     async def test_key_deleted_and_never_written_to_database(self):
-        self.bot.store.cancel(self.wid)
+        self.bot.store.cancel(self.wid, user_id=123)
         # Ephemeral fixture, not a funded key or a production secret.
         key = Account.create().key.hex()
         update = NS(effective_user=NS(id=123), effective_chat=NS(id=123, type='private'),
                     message=NS(delete=AsyncMock()))
         await self.bot.key(update, NS(args=[key]))
         update.message.delete.assert_awaited_once()
-        self.assertEqual(self.bot.account.address, Account.from_key(key).address)
+        self.assertEqual(self.bot.accounts[123].address, Account.from_key(key).address)
         for call in self.bot.notify.call_args_list:
             self.assertNotIn(key, str(call))
         dump = '\n'.join(self.bot.store.db.iterdump())
@@ -124,20 +126,20 @@ class BotTests(IsolatedAsyncioTestCase):
     async def test_key_rejected_if_delete_fails(self):
         update = NS(effective_user=NS(id=123), effective_chat=NS(id=123, type='private'),
                     message=NS(delete=AsyncMock(side_effect=RuntimeError())))
-        previous = self.bot.account
+        previous = self.bot.accounts[123]
         await self.bot.key(update, NS(args=[Account.create().key.hex()]))
-        self.assertIs(self.bot.account, previous)
+        self.assertIs(self.bot.accounts[123], previous)
 
     async def test_restart_does_not_bind_watch_to_new_wallet(self):
-        self.bot.account = None
+        self.bot.accounts.clear()
         update = NS(effective_user=NS(id=123), effective_chat=NS(id=123, type='private'),
                     message=NS(delete=AsyncMock()))
         await self.bot.key(update, NS(args=[Account.create().key.hex()]))
-        self.assertIsNone(self.bot.account)
+        self.assertNotIn(123, self.bot.accounts)
 
     async def test_live_send_failure_does_not_rebuy(self):
         object.__setattr__(self.bot.config, 'dry_run', False)
-        self.bot.account = NS(address=WALLET, sign_transaction=Mock(
+        self.bot.accounts[123] = NS(address=WALLET, sign_transaction=Mock(
             return_value=NS(hash=HexBytes('0x' + 'ab'*32), raw_transaction=b'fixture')))
         self.bot.chain.web3.eth.send_raw_transaction.side_effect = TimeoutError()
         await self.bot.evaluate(self.wid, self.payload, self.head)

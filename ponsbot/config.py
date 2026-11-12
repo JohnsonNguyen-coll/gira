@@ -27,9 +27,9 @@ class Config:
     def load(cls):
         load_dotenv()
         token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-        owner = int(os.environ.get("TELEGRAM_OWNER_ID", "0"))
-        if not token or owner <= 0:
-            raise ValueError("Set TELEGRAM_BOT_TOKEN and TELEGRAM_OWNER_ID in .env")
+        owner = int(os.environ.get("TELEGRAM_OWNER_ID", "0").strip() or "0")
+        if not token or owner < 0:
+            raise ValueError("Set TELEGRAM_BOT_TOKEN; TELEGRAM_OWNER_ID is an optional admin ID")
         c = cls(token, owner, os.environ.get("RPC_URL", "https://rpc.mainnet.chain.robinhood.com"),
                 os.environ.get("PONS_FACTORY", "0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e"),
                 os.environ.get("DRY_RUN", "true").lower() != "false",
